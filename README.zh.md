@@ -1,5 +1,10 @@
 # dsh-cloudflare-mcp
 
+> 本仓库维护在 [MuyuYanran/dsh-cloudflare-mcp](https://github.com/MuyuYanran/dsh-cloudflare-mcp)，
+> 延续自最初的 [zhengjy01/dsh-cloudflare-mcp](https://github.com/zhengjy01/dsh-cloudflare-mcp)。
+> OAuth 客户端、连接守护与设置面板均为原作者的工作；标准 MCP 行、回环 MCP 端点
+> 以及服务总开关是本分支新增的部分。
+
 DeepSeek Harness (DSH) 的 Cloudflare MCP 连接插件：官方 Cloudflare API MCP
 服务器（[mcp.cloudflare.com](https://mcp.cloudflare.com/mcp)）+ 完整的
 OAuth 2.0 客户端流程（动态客户端注册、PKCE S256、回调挂在 GUI 自己的

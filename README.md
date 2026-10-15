@@ -1,5 +1,12 @@
 # dsh-cloudflare-mcp
 
+> This repository is maintained at
+> [MuyuYanran/dsh-cloudflare-mcp](https://github.com/MuyuYanran/dsh-cloudflare-mcp),
+> continuing the original [zhengjy01/dsh-cloudflare-mcp](https://github.com/zhengjy01/dsh-cloudflare-mcp).
+> The OAuth client, the connection supervision and the settings panel are
+> upstream's work; the standard MCP row, the loopback MCP endpoint and the
+> service switch are what this fork adds.
+
 Cloudflare MCP connection for DeepSeek Harness (DSH): the official
 Cloudflare API MCP server ([mcp.cloudflare.com](https://mcp.cloudflare.com/mcp))
 with the full OAuth 2.0 client dance — dynamic client registration, PKCE

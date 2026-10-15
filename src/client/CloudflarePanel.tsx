@@ -59,7 +59,19 @@ function statusText(view: CloudflareMcpStatusView | null): string {
     return '未授权 — 点击「开始授权」并在 Cloudflare 登录页完成授权后，MCP 工具即可用。'
   }
   const connected = view.connected ? '已连接' : '未连接'
-  return `已授权 · 令牌更新于 ${view.tokenUpdatedAt} · MCP ${connected} · 工具 ${view.toolCount} 个`
+  return `已授权 · 令牌更新于 ${view.tokenUpdatedAt} · MCP ${connected} · 上游工具 ${view.toolCount} 个`
+}
+
+/** One line about the shared MCP-service switch. */
+function serviceText(view: CloudflareMcpStatusView | null): string {
+  const service = view?.service
+  if (service === undefined) return ''
+  const manager = service.managerManaged
+    ? '与「设置 → MCP 管理」里 cloudflare 这一行是同一个开关'
+    : '未检测到 MCP 管理插件，此处即唯一开关'
+  return service.enabled
+    ? `运行中 · 模型可见 mcp__cloudflare__* 工具 ${service.modelToolCount} 个 · ${manager}`
+    : `已关闭 · 模型不再看到 Cloudflare 工具与本插件公告（不消耗这部分提示词额度）· ${manager}`
 }
 
 /** The settings panel component. */
@@ -153,6 +165,38 @@ export function CloudflareMcpSettingsPanel(): JSX.Element {
   }
 
   const authorized = Boolean(view && view.authorized)
+  const serviceOn = view?.service?.enabled !== false
+  const upstreamCount = view?.service?.mode === 'direct' ? (view?.toolCount ?? 0) : (view?.service?.modelToolCount || view?.toolCount || 0)
+
+  /**
+   * Flip the MCP service. The host writes the `disabled` override of the shared
+   * `mcp-cloudflare` row, so the manager page's toggle is the same operation;
+   * the profile then reloads within about a second, and this poll is what shows
+   * the converged state instead of the echoed one.
+   */
+  const toggleService = (): void => {
+    void run(async () => {
+      const result = await api.setService(!serviceOn)
+      if (!result.ok) {
+        // Put the checkbox back: the write failed, so the state never changed.
+        void refreshStatus()
+        return { message: '[failed] ' + (result.error ?? '切换失败') }
+      }
+      let latest: CloudflareMcpStatusView | null = null
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 400))
+        try {
+          latest = await api.status()
+          const service = latest.service
+          if (service !== undefined && service.modelToolCount > 0 === service.enabled) break
+        } catch {
+          // Keep polling: the host is mid-reload.
+        }
+      }
+      if (latest !== null) setView(latest)
+      return { message: result.message ?? '' }
+    })
+  }
 
   return (
     <div style={s.card}>
@@ -162,6 +206,17 @@ export function CloudflareMcpSettingsPanel(): JSX.Element {
       <div style={s.hint}>
         通过官方 OAuth 连接 mcp.cloudflare.com，授权后 Cloudflare API 工具以 mcp__cloudflare__* 形式在会话中可用
         （账户信息、Workers、Pages、DNS、R2、KV、D1、AI 等）。令牌存 {view?.configPath ?? '~/.dsh/dsh-cloudflare-mcp.json'}（权限 0600）。
+        这些工具由标准 MCP 行 <code>mcp-cloudflare</code> 承载，端点 {view?.mcpEndpoint ?? '/mcp/cloudflare'}。
+      </div>
+
+      <label style={{ ...s.row, cursor: 'pointer' }}>
+        <input type="checkbox" checked={serviceOn} disabled={busy} onChange={toggleService} />
+        <span style={{ fontWeight: 600 }}>启用 Cloudflare MCP 服务</span>
+      </label>
+      <div style={s.hint}>{serviceText(view)}</div>
+      <div style={s.hint}>
+        关闭后，约 {upstreamCount} 个工具定义与本插件的公告文本都不再进入提示词，这部分 token 开销随之消失；
+        OAuth 授权与本设置页保留（上游连接会断开，重新打开时自动恢复），随时可再启用。
       </div>
 
       <div style={s.row}>

@@ -1,12 +1,34 @@
 # dsh-cloudflare-mcp bundle patch: inserts the plugin row into the profile
-# roster. Applied as a profile bundle layer (declared by the `dsh.bundle.patch`
-# manifest field in package.json). Activate with:
+# roster, plus the standard MCP client row that carries the model-facing tools.
+#
+# Applied as a profile bundle layer (declared by the `dsh.bundle.patch` manifest
+# field in package.json). Activate with:
 #
 #   # local development (link)
 #   dsh plugin --profile web add link:/path/to/dsh-cloudflare-mcp
 - insert:
+    # The plugin half: OAuth flow, settings panel, loopback MCP endpoint, and the
+    # cloudflare_mcp_* helpers. Always mounted — with the MCP service off it still
+    # answers /api/dsh-cloudflare-mcp/*, which is how the service gets turned back
+    # on from the settings page.
     - id: cloudflare-mcp
       name: dsh-cloudflare-mcp
       config:
         announceToAgent: true   # 在系统提示中公告插件（工具 + 能力说明）
         enabled: true           # 插件总开关
+
+    # The model-facing half: an ordinary MCP server row pointed at this plugin's
+    # loopback endpoint, which re-exposes the plugin's OAuth-authenticated
+    # connection over the standard protocol. That makes `mcp__cloudflare__*` come
+    # from a plain row, so dsh-mcp-manager-plus lists / enables / disables /
+    # restarts the Cloudflare connection like any other server — and the plugin's
+    # own settings switch writes the very same `disabled` override on this row.
+    # `!!js` carries the live GUI port; `ctx.get` is the synchronous form, and
+    # `webServer` is injected so the value exists when the config resolves.
+    - id: mcp-cloudflare
+      name: '@deepseek-ai/dsh-mcp-client'
+      inject: [webServer]
+      config:
+        serverName: cloudflare
+        transport: streamable-http
+        url: !!js "'http://127.0.0.1:' + String(ctx.get('webServer')?.port ?? 3080) + '/mcp/cloudflare'"

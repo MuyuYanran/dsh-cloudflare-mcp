@@ -7,12 +7,22 @@
  * client registration + PKCE authorization URL), which proves the whole
  * auth chain without needing a browser.
  *
- *   DSH_CLOUDFLARE_MCP_CONFIG=/tmp/cf-test.json node tests/smoke.mjs
- *   DSH_CLOUDFLARE_MCP_LIVE=1 DSH_CLOUDFLARE_MCP_CONFIG=/tmp/cf-test.json node tests/smoke.mjs
+ *   DSH_CLOUDFLARE_MCP_LIVE=1 node tests/smoke.mjs
+ *
+ * The store writes a real file, so the config path is ALWAYS redirected to a
+ * throwaway temp file: run this against the default path and it reads,
+ * overwrites and finally deletes the live OAuth credentials of this machine.
  */
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { CloudflareMcpStore, OAuthFlow, CloudflareOAuthProvider, mask, MCP_URL, configPath } from '../lib/index.js'
+
+// Set before anything can touch the store, so configPath() can never answer with
+// the machine's real credential file.
+process.env.DSH_CLOUDFLARE_MCP_CONFIG = join(mkdtempSync(join(tmpdir(), 'cfmcp-smoke-')), 'credentials.json')
 
 const live = process.env.DSH_CLOUDFLARE_MCP_LIVE === '1'
 

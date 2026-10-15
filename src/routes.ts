@@ -12,6 +12,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { CloudflareMcpStore } from './store.ts'
 import type { OAuthFlow } from './oauth.ts'
 import type { McpSupervisor } from './mcp.ts'
+import { MCP_BRIDGE_PATH } from './bridge.ts'
 
 /** Route paths. */
 export const CLOUDFLARE_MCP_API = {
@@ -22,7 +23,18 @@ export const CLOUDFLARE_MCP_API = {
   oauthRefresh: '/api/dsh-cloudflare-mcp/oauth/refresh',
   test: '/api/dsh-cloudflare-mcp/test',
   clear: '/api/dsh-cloudflare-mcp/clear',
+  /** Enable/disable the MCP service row (shared with dsh-mcp-manager-plus). */
+  service: '/api/dsh-cloudflare-mcp/service',
 } as const
+
+/** Port of a loopback URL; 0 when it cannot be parsed. */
+function portOf(url: string): number {
+  try {
+    return Number(new URL(url).port) || 0
+  } catch {
+    return 0
+  }
+}
 
 /** Cap on JSON request bodies. */
 const MAX_JSON_BODY_BYTES = 64 * 1024
@@ -119,15 +131,44 @@ export interface RouteContext {
   supervisor: McpSupervisor
   /** The loopback OAuth callback URL. */
   callbackUrl: string
+  /** The MCP-service switch, backed by the profile patch layer. */
+  service: ServiceControl
+  /**
+   * Bring the upstream connection up after a successful authorization and then
+   * re-run the standard MCP row so it re-discovers its tools. Sequenced
+   * deliberately: restarting the row while the upstream is still down would have
+   * it discover nothing again, which is the state the user was just in.
+   */
+  authorized(): void
+}
+
+/**
+ * The MCP-service switch. `state()` reads the profile patch layer — the same
+ * file and the same row dsh-mcp-manager-plus writes — and `set()` writes it, so
+ * the settings panel and the manager page cannot disagree.
+ */
+export interface ServiceControl {
+  state(): ServiceState
+  set(enabled: boolean): ServiceState
+}
+
+/** The switch state (mirrors the host contract in src/index.ts). */
+export interface ServiceState {
+  enabled: boolean
+  mounted: boolean
+  mode: 'bridge' | 'direct'
+  managerManaged: boolean
+  modelToolCount: number
+  patchPath: string
 }
 
 /**
  * Build every /api/dsh-cloudflare-mcp route (exact paths).
- * @param deps - store, oauth flow, MCP supervisor, callback URL.
+ * @param deps - store, oauth flow, MCP supervisor, callback URL, service switch.
  * @returns the route list.
  */
 export function makeRoutes(deps: RouteContext) {
-  const { store, flow, supervisor, callbackUrl } = deps
+  const { store, flow, supervisor, callbackUrl, service, authorized } = deps
 
   const guard = (req: IncomingMessage, res: ServerResponse, method: string): boolean => {
     if (!isLoopbackRequest(req)) {
@@ -143,10 +184,29 @@ export function makeRoutes(deps: RouteContext) {
 
   const statusView = async (): Promise<Record<string, unknown>> => {
     const view = await store.view(callbackUrl)
+    const state = service.state()
     return {
       ...view,
       connected: supervisor.isConnected(),
       toolCount: supervisor.toolCount(),
+      mcpEndpoint: `http://127.0.0.1:${portOf(callbackUrl)}${MCP_BRIDGE_PATH}`,
+      service: state,
+    }
+  }
+
+  /** Report one switch outcome with a freshly read state. */
+  const serviceResult = (enabled: boolean): Record<string, unknown> => {
+    try {
+      const state = service.set(enabled)
+      return {
+        ok: true,
+        message: state.enabled
+          ? 'Cloudflare MCP 服务已开启：mcp__cloudflare__* 工具与插件公告会重新进入提示词。'
+          : 'Cloudflare MCP 服务已关闭：模型不再看到 mcp__cloudflare__* 工具与插件公告，因此不再消耗这部分提示词额度。随时可重新开启。',
+        service: state,
+      }
+    } catch (error) {
+      return { ok: false, error: String(error instanceof Error ? error.message : error), service: service.state() }
     }
   }
 
@@ -197,8 +257,9 @@ export function makeRoutes(deps: RouteContext) {
           writeHtml(res, 400, '授权失败', result.message)
           return
         }
-        // Tokens are in the store; bring the MCP connection up.
-        void supervisor.start().catch(() => {})
+        // Tokens are in the store: bring the connection up and let the standard
+        // row re-discover, so the tools appear without restarting the host.
+        authorized()
         writeHtml(res, 200, '授权成功', 'Cloudflare MCP 授权已完成，令牌已保存。现在可以关闭此页面，回到 DSH 设置面板或继续对话。')
       },
     },
@@ -225,9 +286,7 @@ export function makeRoutes(deps: RouteContext) {
           return
         }
         const result = await flow.complete(code, '')
-        if (result.ok) {
-          void supervisor.start().catch(() => {})
-        }
+        if (result.ok) authorized()
         writeJson(res, 200, { ok: result.ok, message: result.message, view: await statusView() })
       },
     },
@@ -286,6 +345,21 @@ export function makeRoutes(deps: RouteContext) {
         await supervisor.dispose()
         await store.clearAll()
         writeJson(res, 200, { ok: true, message: '已清除 Cloudflare MCP 的令牌与客户端注册。', view: await statusView() })
+      },
+    },
+    {
+      kind: 'exact' as const,
+      path: CLOUDFLARE_MCP_API.service,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (!guard(req, res, 'POST')) return
+        const body = await readJsonBody(req)
+        if (body === undefined || typeof body.enabled !== 'boolean') {
+          writeJson(res, 400, { error: '缺少布尔参数 enabled' })
+          return
+        }
+        // The patch layer is the truth and dsh-mcp-manager-plus reads the same
+        // row, so this write IS the manager's toggle — nothing to sync twice.
+        writeJson(res, 200, serviceResult(body.enabled))
       },
     },
   ]

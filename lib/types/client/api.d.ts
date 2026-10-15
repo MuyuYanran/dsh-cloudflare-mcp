@@ -13,6 +13,19 @@ export interface CloudflareMcpStatusView {
     configPath: string;
     connected: boolean;
     toolCount: number;
+    /** Loopback MCP endpoint the standard MCP row connects to. */
+    mcpEndpoint?: string;
+    /** The MCP-service switch (same row dsh-mcp-manager-plus toggles). */
+    service?: CloudflareMcpServiceState;
+}
+/** The MCP-service switch state, as the host reports it. */
+export interface CloudflareMcpServiceState {
+    enabled: boolean;
+    mounted: boolean;
+    mode: 'bridge' | 'direct';
+    managerManaged: boolean;
+    modelToolCount: number;
+    patchPath: string;
 }
 /** Error carrying the route's JSON error message. */
 export declare class CloudflareMcpApiError extends Error {
@@ -47,5 +60,16 @@ export declare class CloudflareMcpApi {
         ok: boolean;
         message: string;
         view: CloudflareMcpStatusView;
+    }>;
+    /**
+     * Turn the MCP service on or off. The host writes the `disabled` override of
+     * the standard `mcp-cloudflare` row in the profile patch layer — the very row
+     * dsh-mcp-manager-plus lists — so this is the same switch, seen from here.
+     */
+    setService(enabled: boolean): Promise<{
+        ok: boolean;
+        message?: string;
+        error?: string;
+        service?: CloudflareMcpServiceState;
     }>;
 }

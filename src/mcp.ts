@@ -93,8 +93,65 @@ export interface McpSupervisor {
   toolCount(): number
   /** List the MCP server's tools (live probe; requires a connected client). */
   listTools(): Promise<string[]>
+  /**
+   * The upstream tool definitions (wire shapes, raw names). Connects on demand,
+   * so a lazy caller never has to sequence `start()` itself.
+   */
+  listToolDefinitions(): Promise<ToolDefinition[]>
+  /** Forward one tool call to the upstream server. Connects on demand. */
+  callTool(rawName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<UpstreamCallResult>
+  /**
+   * Flip this supervisor between registering its tools on `ctx.tools` and only
+   * serving them through the loopback endpoint. Turning registration off drops
+   * every tool definition (and with it the tokens they cost) without closing the
+   * upstream connection, so switching back on is instant.
+   */
+  setRegistration(enabled: boolean): void
+  /** Whether the supervisor currently owns `ctx.tools` registrations. */
+  isRegistrationOn(): boolean
+  /**
+   * Close the upstream connection and drop every tool definition, staying
+   * restartable. The switch calls this when the service goes off so an unused
+   * Cloudflare connection holds nothing open.
+   */
+  stop(): Promise<void>
   /** Stop the supervisor and unregister all tools. */
   dispose(): Promise<void>
+}
+
+/** One upstream tool, as the Cloudflare MCP server advertised it. */
+export interface ToolDefinition {
+  name: string
+  description?: string
+  inputSchema: Record<string, unknown>
+}
+
+/** The upstream `tools/call` result, before any bridging. */
+export type UpstreamCallResult = { content?: unknown; isError?: boolean; toolResult?: unknown; [key: string]: unknown }
+
+/** One ctx.tools registration built from an advertised upstream tool. */
+export interface ToolRegistration {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+  output: {
+    schema: Record<string, unknown>
+    render(args: unknown, value: unknown): Array<{ type: 'text'; text: string }>
+  }
+  execute(args: unknown, exec: { signal: AbortSignal }): Promise<unknown>
+}
+
+/** Supervisor construction options. */
+export interface SupervisorOptions {
+  /**
+   * When false the supervisor keeps the connection and the discovered tool set
+   * but registers nothing on `ctx.tools` — the loopback MCP endpoint serves the
+   * model instead, and registration is @deepseek-ai/dsh-mcp-client's job.
+   * Defaults to true.
+   */
+  registerTools?: boolean
+  /** Called whenever the advertised tool set changes (used to notify bridge sessions). */
+  onToolsetChanged?: () => void
 }
 
 /**
@@ -103,6 +160,7 @@ export interface McpSupervisor {
  * @param store - credential store (tokens gate the connection).
  * @param flow - OAuth flow providing the transport's auth provider.
  * @param callbackUrl - the loopback OAuth callback URL.
+ * @param options - registration behaviour, see {@link SupervisorOptions}.
  * @returns the supervisor handle.
  */
 export function createSupervisor(
@@ -110,8 +168,16 @@ export function createSupervisor(
   store: CloudflareMcpStore,
   flow: OAuthFlow,
   callbackUrl: string,
+  options: SupervisorOptions = {},
 ): McpSupervisor {
+  let registerToolsOn = options.registerTools !== false
   const label = 'cloudflare-mcp'
+  /** The tools the upstream server last advertised (wire shapes). */
+  let advertisedTools: ToolDefinition[] = []
+  /** The last built ctx.tools definitions, kept so registration can be re-applied. */
+  let lastDefinitions: ToolRegistration[] = []
+  /** Notified when the advertised tool set changes (the bridge pushes the MCP notification). */
+  const onToolsetChanged: (() => void) | undefined = options.onToolsetChanged
   let client: Client | null = null
   let clientClosed: Promise<void> | null = null
   let disposers = new Map<string, () => void>()
@@ -135,49 +201,39 @@ export function createSupervisor(
 
   function syncTools(generation: Client): Promise<Map<string, () => void>> {
     return listToolsAll(generation).then((tools) => {
-      const definitions = tools.map((tool) => ({
-        name: publicToolName(tool.name),
-        description: tool.description ?? '',
-        parameters: tool.inputSchema,
-        output: {
-          schema: {
-            type: 'object' as const,
-            properties: {
-              content: { type: 'array' as const, items: {} },
-              structuredContent: {},
-            },
-            required: ['content'],
-            additionalProperties: false,
-          },
-          render(_args: unknown, value: unknown): Array<{ type: 'text'; text: string }> {
-            const content = typeof value === 'object' && value !== null
-              ? (value as Record<string, unknown>).content
-              : undefined
-            return [{ type: 'text', text: extractText(content, tool.name) }]
-          },
-        },
-        execute: async (args: unknown, exec: { signal: AbortSignal }): Promise<unknown> => {
-          const cleanArgs = typeof args === 'object' && args !== null ? args as Record<string, unknown> : {}
-          const result = await callToolUncached(generation, tool.name, cleanArgs, exec.signal)
-          if (!Array.isArray(result.content)) {
-            const text = 'toolResult' in result ? JSON.stringify(result.toolResult) : '(no output)'
-            if (result.isError === true) throw new Error(text)
-            return { content: [{ type: 'text', text }] }
-          }
-          if (result.isError === true) throw new Error(extractText(result.content, tool.name))
-          return { content: result.content }
-        },
-      }))
-      for (const dispose of disposers.values()) dispose()
-      const next = new Map<string, () => void>()
-      for (const definition of definitions) {
-        next.set(definition.name, ctx.tools.register(definition))
-      }
-      return next
+      // Keep the wire definitions for the loopback MCP endpoint even when this
+      // supervisor registers nothing on ctx.tools.
+      const changed = tools.map((tool) => tool.name).join('\n') !== advertisedTools.map((tool) => tool.name).join('\n')
+      advertisedTools = tools
+      lastDefinitions = buildToolDefinitions(generation, tools)
+      applyRegistration()
+      if (changed) onToolsetChanged?.()
+      return disposers
     })
   }
 
-  async function listToolsAll(generation: Client): Promise<Array<{ name: string; description?: string; inputSchema: Record<string, unknown> }>> {
+  /** Rebuild `ctx.tools` registrations from the cached definitions. */
+  function applyRegistration(): void {
+    for (const dispose of disposers.values()) dispose()
+    const next = new Map<string, () => void>()
+    if (registerToolsOn) {
+      for (const definition of lastDefinitions) {
+        next.set(definition.name, ctx.tools.register(definition))
+      }
+    }
+    disposers = next
+  }
+
+  /** Bring the connection up if needed, then return the advertised tool set. */
+  async function ensureTools(): Promise<ToolDefinition[]> {
+    if (client === null) await connectGeneration(false)
+    if (client === null) throw new Error('Cloudflare MCP 无法连接：请先完成 OAuth 授权。')
+    await syncChain
+    if (advertisedTools.length === 0) advertisedTools = await listToolsAll(client)
+    return advertisedTools
+  }
+
+  async function listToolsAll(generation: Client): Promise<ToolDefinition[]> {
     const tools: Array<{ name: string; description?: string; inputSchema: Record<string, unknown> }> = []
     let cursor: string | undefined
     do {
@@ -204,11 +260,82 @@ export function createSupervisor(
     return result as { content?: unknown; isError?: boolean; toolResult?: unknown }
   }
 
+  /**
+   * Build the ctx.tools definitions for one advertised tool set. The executor
+   * closes over the generation it was discovered on, so a stale generation's
+   * tools are always dropped before they could be registered.
+   */
+  function buildToolDefinitions(generation: Client, tools: ToolDefinition[]): ToolRegistration[] {
+    return tools.map((tool) => ({
+      name: publicToolName(tool.name),
+      description: tool.description ?? '',
+      parameters: tool.inputSchema,
+      output: {
+        schema: {
+          type: 'object' as const,
+          properties: {
+            content: { type: 'array' as const, items: {} },
+            structuredContent: {},
+          },
+          required: ['content'],
+          additionalProperties: false,
+        },
+        render(_args: unknown, value: unknown): Array<{ type: 'text'; text: string }> {
+          const content = typeof value === 'object' && value !== null
+            ? (value as Record<string, unknown>).content
+            : undefined
+          return [{ type: 'text', text: extractText(content, tool.name) }]
+        },
+      },
+      execute: async (args: unknown, exec: { signal: AbortSignal }): Promise<unknown> => {
+        const cleanArgs = typeof args === 'object' && args !== null ? args as Record<string, unknown> : {}
+        const result = await callToolUncached(generation, tool.name, cleanArgs, exec.signal)
+        if (!Array.isArray(result.content)) {
+          const text = 'toolResult' in result ? JSON.stringify(result.toolResult) : '(no output)'
+          if (result.isError === true) throw new Error(text)
+          return { content: [{ type: 'text', text }] }
+        }
+        if (result.isError === true) throw new Error(extractText(result.content, tool.name))
+        return { content: result.content }
+      },
+    }))
+  }
+
   function generationDown(generation: Client): void {
     if (!isCurrent(generation)) return
     client = null
     clientClosed = null
     scheduleReconnect()
+  }
+
+  /**
+   * Close the current generation without scheduling a reconnect, and drop every
+   * tool registration. Used by the service switch (off) and by disposal; both
+   * stay restartable afterwards — `start()` simply opens a fresh generation.
+   */
+  async function stopConnection(): Promise<void> {
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    failedAttempts = 0
+    const current = client
+    const currentClosed = clientClosed
+    // Detach before closing so the generation's `onclose` cannot schedule a
+    // reconnect for a connection the user just turned off.
+    client = null
+    clientClosed = null
+    if (current !== null) {
+      try {
+        await current.close()
+      } catch {}
+      if (currentClosed !== null && !await waitForClose(currentClosed)) {
+        ctx.logger.error(`${label}: generation did not close within ${GENERATION_CLOSE_TIMEOUT_MS}ms during stop`)
+      }
+    }
+    await syncChain
+    for (const dispose of disposers.values()) dispose()
+    disposers = new Map()
   }
 
   function waitForClose(closed: Promise<void>): Promise<boolean> {
@@ -327,34 +454,41 @@ export function createSupervisor(
       return client !== null
     },
     toolCount(): number {
-      return disposers.size
+      // In registration mode the count is what this supervisor put on ctx.tools;
+      // in proxy mode the same set reaches the model through the loopback
+      // endpoint and @deepseek-ai/dsh-mcp-client, so the advertised set is the
+      // number of tools the model can actually call.
+      return registerToolsOn ? disposers.size : advertisedTools.length
+    },
+    setRegistration(next: boolean): void {
+      if (next === registerToolsOn) return
+      registerToolsOn = next
+      applyRegistration()
+    },
+    isRegistrationOn(): boolean {
+      return registerToolsOn
     },
     async listTools(): Promise<string[]> {
       if (client === null) throw new Error('Cloudflare MCP 未连接。')
       const tools = await listToolsAll(client)
       return tools.map((tool) => tool.name)
     },
+    async listToolDefinitions(): Promise<ToolDefinition[]> {
+      return ensureTools()
+    },
+    async callTool(rawName, args, signal) {
+      if (client === null) await connectGeneration(false)
+      const generation = client
+      if (generation === null) throw new Error('Cloudflare MCP 未连接：请先在设置页完成授权。')
+      return callToolUncached(generation, rawName, args, signal ?? new AbortController().signal)
+    },
+    async stop(): Promise<void> {
+      await stopConnection()
+    },
     async dispose(): Promise<void> {
       disposed = true
-      if (reconnectTimer !== null) {
-        clearTimeout(reconnectTimer)
-        reconnectTimer = null
-      }
-      const current = client
-      const currentClosed = clientClosed
-      client = null
-      clientClosed = null
-      if (current !== null) {
-        try {
-          await current.close()
-        } catch {}
-        if (currentClosed !== null && !await waitForClose(currentClosed)) {
-          ctx.logger.error(`${label}: generation did not close within ${GENERATION_CLOSE_TIMEOUT_MS}ms during disposal`)
-        }
-      }
-      await syncChain
-      for (const dispose of disposers.values()) dispose()
-      disposers = new Map()
+      advertisedTools = []
+      await stopConnection()
     },
   }
 }

@@ -1,7 +1,7 @@
 {
   "name": "dsh-cloudflare-mcp",
-  "version": "0.1.2",
-  "description": "Cloudflare MCP connection for DeepSeek Harness: official OAuth 2.0 flow (dynamic client registration + PKCE) against mcp.cloudflare.com, Cloudflare API tools under mcp__cloudflare__*, and a web settings panel",
+  "version": "0.2.0",
+  "description": "Cloudflare MCP connection for DeepSeek Harness: official OAuth 2.0 flow (dynamic client registration + PKCE) against mcp.cloudflare.com, its tools registered as a standard @deepseek-ai/dsh-mcp-client row (manageable from dsh-mcp-manager-plus) with a service switch that frees the prompt tokens when unused, and a web settings panel",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -52,7 +52,8 @@
     "bundle": "tsdown",
     "watch": "tsdown --watch",
     "typecheck": "tsc --noEmit",
-    "test": "node tests/smoke.mjs"
+    "test": "node tests/smoke.mjs && node tests/patch.test.mjs && node tests/patch-shape.test.mjs && node tests/bridge.test.mjs && node tests/host.test.mjs",
+    "test:live": "DSH_CLOUDFLARE_MCP_LIVE=1 node tests/smoke.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
